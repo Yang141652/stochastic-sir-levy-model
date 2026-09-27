@@ -187,9 +187,6 @@ for (k in 2:steps) {
   R_det[k] <- R_det[k - 1] +
     dR_drift * dt
   
-  S_det[k] <- max(S_det[k], 0)
-  I_det[k] <- max(I_det[k], 0)
-  R_det[k] <- max(R_det[k], 0)
 }
 
 ## ====== Pre-generate Brownian motion increments ======
