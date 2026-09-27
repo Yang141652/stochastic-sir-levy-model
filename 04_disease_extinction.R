@@ -123,9 +123,6 @@ for (k in 2:steps) {
   I_det[k] <- I_det[k - 1] + dI_drift * dt
   R_det[k] <- R_det[k - 1] + dR_drift * dt
   
-  S_det[k] <- max(S_det[k], 0)
-  I_det[k] <- max(I_det[k], 0)
-  R_det[k] <- max(R_det[k], 0)
 }
 
 ## ====== Pre-generate Brownian motion increments ======
@@ -182,10 +179,7 @@ for (k in 2:steps) {
     dR_drift * dt +
     R_wn[k - 1] * dW3
   
-  
-  S_wn[k] <- max(S_wn[k], 0)
-  I_wn[k] <- max(I_wn[k], 0)
-  R_wn[k] <- max(R_wn[k], 0)
+
 }
 
 ## ====== 3. White noise + jump solution ======
@@ -246,10 +240,7 @@ for (k in 2:steps) {
     dR_drift * dt +
     R_wnj[k - 1] * dW3 +
     jump_R
-  
-  S_wnj[k] <- max(S_wnj[k], 0)
-  I_wnj[k] <- max(I_wnj[k], 0)
-  R_wnj[k] <- max(R_wnj[k], 0)
+
 }
 
 ## ====== Create data frame ======
