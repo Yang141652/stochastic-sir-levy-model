@@ -22,7 +22,7 @@ L <- matrix(c(3, 2, 1,
               1, 2, 4),
             nrow = 3, ncol = 3, byrow = TRUE)
 
-L_1 <- 0.01 * L
+L_1 <- 0.001 * L
 
 ## ====== Initial values ======
 
