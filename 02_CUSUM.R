@@ -27,7 +27,7 @@ L <- matrix(
   byrow = TRUE
 )
 
-L_1 <- 0.01 * L
+L_1 <- 0.001 * L
 
 ## ====== Initial values ======
 
