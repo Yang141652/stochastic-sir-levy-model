@@ -1,496 +1,846 @@
-library(MASS)
-library(SymTS)
-library(cusum)
+# -------------------------- required packages --------------------------
 
-## ====== Parameters ======
+required_packages <- c("ggplot2", "scales")
 
-Lambda  <- 8       # Recruitment rate
-mu      <- 5.3     # Natural mortality rate
-beta    <- 6     # Transmission coefficient
-epsilon <- 0.5     # Disease-induced mortality rate
-eta     <- 1       # Dimensionless recovery rate
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    function(pkg) requireNamespace(pkg, quietly = TRUE),
+    logical(1)
+  )
+]
 
-## Drift vector
-gamma_1 <- -0.3
-gamma_2 <- 0.5
-gamma_3 <- 0.2
-
-## ====== Covariance matrix L (3x3) ======
-
-L <- matrix(c(3, 2, 1,
-              2, 3, 2,
-              1, 2, 4),
-            nrow = 3, ncol = 3, byrow = TRUE)
-
-L_1 <- 0.001 * L
-
-## ====== Initial values ======
-
-S0 <- 1.6
-I0 <- 0.4
-R0 <- 0.04
-
-## ====== Time settings ======
-
-dt   <- 0.01       # Step size
-Tend <- 600       # Total time
-time <- seq(0, Tend, by = dt)
-steps <- length(time)
-
-## Number of random increments required
-
-n_inc <- steps - 1
-
-## ====== Jump parameters ======
-
-w <- 0.5          # w ∈ [0,1]
-
-## ====== Direction vector ======
-
-theta_values <- seq(0, 2*pi, length.out = 7)[-1]
-
-# Create the direction matrix with 3 rows and 6 columns
-
-direction_matrix <- matrix(0, nrow = 3, ncol = 6)
-
-for (p in 1:6) {
-  theta <- theta_values[p]
-  direction_matrix[1, p] <-  sqrt(1 - w^2) * cos(theta)
-  direction_matrix[2, p] <- sqrt(1 - w^2) * sin(theta)
-  direction_matrix[3, p] <- w
+if (length(missing_packages) > 0L) {
+  install.packages(
+    missing_packages,
+    repos = "https://cloud.r-project.org"
+  )
 }
 
-# Print the direction matrix
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(scales)
+})
 
-print(direction_matrix)
+library(grid)
 
-ell <- 1
+set.seed(20261016)
 
-jump_1 <- rCTS(n_inc, alpha = 0.4, c = 1 * dt, ell = ell, mu = 0)
-jump_2 <- rCTS(n_inc, alpha = 0.4, c = 5 * dt, ell = ell, mu = 0)
-jump_3 <- rCTS(n_inc, alpha = 0.4, c = 5 * dt, ell = ell, mu = 0)
-jump_4 <- rCTS(n_inc, alpha = 0.4, c = 5 * dt, ell = ell, mu = 0)
-jump_5 <- rCTS(n_inc, alpha = 0.4, c = 1 * dt, ell = ell, mu = 0)
-jump_6 <- rCTS(n_inc, alpha = 0.4, c = 1 * dt, ell = ell, mu = 0)
+# ----------------------------- parameters -----------------------------
 
-jump_matrix <- rbind(jump_1, jump_2, jump_3,
-                     jump_4, jump_5, jump_6)
+Lam <- 8.0
+mu <- 0.75
+eps <- 0.50
 
-zeta <- c(0.1, 0.1, 0.1)
+g1 <- c(-0.30, 0.50, 0.20)
 
-jump_vector <- matrix(
-  0,
+Phi <- 1e-3 * matrix(
+  c(
+    3, 2, 1,
+    2, 3, 2,
+    1, 2, 4
+  ),
   nrow = 3,
-  ncol = n_inc
+  byrow = TRUE
 )
 
-for (j in 1:6) {
+# Tempered-stable parameters
+alpha <- 0.40
+b_ts <- 1.00
+zeta <- c(0.01, 0.30, 0.01)
+
+omega <- 0.50
+c_dir <- c(1, 5, 5, 5, 1, 1)
+
+theta <- 2 * pi * (1:6) / 6
+
+s_dir <- cbind(
+  sqrt(1 - omega^2) * cos(theta),
+  sqrt(1 - omega^2) * sin(theta),
+  rep(omega, 6)
+)
+
+w_dir <- c_dir * b_ts^(-alpha)
+
+# Raw drift constants.
+# These are used for the Brownian+TS model.
+# The Brownian-only model uses the corrected parameters a_i.
+mu_raw <- c(
+  mu - g1[1],
+  mu + eps + 1 - g1[2],
+  mu - g1[3]
+)
+
+# Calculate a_i = mu_i - integral eta_i(u) nu(du).
+# The logarithmic jump increment in direction j is
+# zeta[i] * s_dir[j, i] * r.
+# Hence eta_i(u) = exp(zeta[i] * s_dir[j, i] * r) - 1.
+eta_mean <- vapply(seq_len(3L), function(i) {
+  sum(
+    w_dir *
+      gamma(-alpha) *
+      (
+        (b_ts - zeta[i] * s_dir[, i])^alpha -
+          b_ts^alpha
+      )
+  )
+}, numeric(1))
+
+a_vec <- mu_raw - eta_mean
+
+names(a_vec) <- c("a1", "a2", "a3")
+
+cat("Raw drift parameters mu_i:\n")
+print(mu_raw)
+
+cat("Jump corrections integral eta_i(u) nu(du):\n")
+print(eta_mean)
+
+cat("Corrected parameters a_i:\n")
+print(a_vec)
+
+# Two beta regimes
+betas <- c(0.232, 0.316)
+
+T_end <- 80.0
+dt <- 0.005
+rec_dt <- 0.25
+n_path <- 1000L
+
+# Initial value
+x0 <- c(
+  S = 5.55,
+  I = 0.50,
+  R = 0.10
+)
+
+# ----------------------- tempered-stable sampler ----------------------
+
+# Positive alpha-stable random variable
+positive_stable <- function(alpha, n) {
   
-  u_j <- outer(
-    direction_matrix[, j],
-    jump_matrix[j, ]
+  U <- runif(n, 0, pi)
+  E <- rexp(n, rate = 1)
+  
+  (
+    sin(alpha * U) / sin(U)^(1 / alpha)
+  ) *
+    (
+      sin((1 - alpha) * U) / E
+    )^((1 - alpha) / alpha)
+}
+
+# Exact tempered-stable increment
+ts_increment <- function(alpha, w, b, dt, n) {
+  
+  scale <- (
+    dt * w * abs(gamma(-alpha))
+  )^(1 / alpha)
+  
+  out <- numeric(n)
+  todo <- seq_len(n)
+  
+  while (length(todo) > 0L) {
+    
+    X <- scale * positive_stable(
+      alpha = alpha,
+      n = length(todo)
+    )
+    
+    accept <- runif(length(todo)) < exp(-b * X)
+    
+    if (any(accept)) {
+      out[todo[accept]] <- X[accept]
+    }
+    
+    todo <- todo[!accept]
+  }
+  
+  out
+}
+
+# Three-dimensional logarithmic TS increment
+ts_log_increment <- function(dt, n) {
+  
+  dL <- matrix(
+    0,
+    nrow = n,
+    ncol = 3
   )
   
-  eta_u_j <- exp(
-    sweep(u_j, 1, zeta, "*")
-  ) - 1
+  for (j in seq_len(nrow(s_dir))) {
+    
+    rj <- ts_increment(
+      alpha = alpha,
+      w = w_dir[j],
+      b = b_ts,
+      dt = dt,
+      n = n
+    )
+    
+    dL <- dL + rj %o% s_dir[j, ]
+  }
   
-  jump_vector <- jump_vector + eta_u_j
-}
-## ====== 1. Deterministic solution ======
-
-S_det <- numeric(steps)
-I_det <- numeric(steps)
-R_det <- numeric(steps)
-
-S_det[1] <- S0
-I_det[1] <- I0
-R_det[1] <- R0
-
-for (k in 2:steps) {
-  
-  dS_drift <- Lambda -
-    mu * S_det[k - 1] -
-    beta * S_det[k - 1] * I_det[k - 1]
-  
-  dI_drift <- beta * S_det[k - 1] * I_det[k - 1] -
-    (mu + epsilon + eta) * I_det[k - 1]
-  
-  dR_drift <- eta * I_det[k - 1] -
-    mu * R_det[k - 1]
-  
-  S_det[k] <- S_det[k - 1] + dS_drift * dt
-  I_det[k] <- I_det[k - 1] + dI_drift * dt
-  R_det[k] <- R_det[k - 1] + dR_drift * dt
-  
-}
-
-## ====== Pre-generate Brownian motion increments ======
-
-dW_matrix <- matrix(0, nrow = n_inc, ncol = 3)
-
-for (k in 1:n_inc) {
-  
-  dW_matrix[k, ] <- mvrnorm(
-    n = 1,
-    mu = c(0, 0, 0),
-    Sigma = L_1 * dt
+  sweep(
+    dL,
+    MARGIN = 2,
+    STATS = zeta,
+    FUN = "*"
   )
 }
 
-## ====== 2. White noise solution ======
+# ------------------------------ simulator ------------------------------
 
-S_wn <- numeric(steps)
-I_wn <- numeric(steps)
-R_wn <- numeric(steps)
-
-S_wn[1] <- S0
-I_wn[1] <- I0
-R_wn[1] <- R0
-
-for (k in 2:steps) {
+simulate_sir <- function(
+    beta,
+    driver = c("Brownian", "Brownian+TS"),
+    T_end,
+    dt,
+    rec_dt,
+    n_path,
+    x0,
+    seed
+) {
   
-  # Drift terms
+  driver <- match.arg(driver)
   
-  dS_drift <- Lambda -
-    mu * S_wn[k - 1] -
-    beta * S_wn[k - 1] * I_wn[k - 1]
+  # Use corrected drift for Brownian-only simulation.
+  # Retain the raw drift for Brownian+TS simulation.
+  mu_drift <- if (driver == "Brownian") {
+    a_vec
+  } else {
+    mu_raw
+  }
   
-  dI_drift <- beta * S_wn[k - 1] * I_wn[k - 1] -
-    (mu + epsilon + eta) * I_wn[k - 1]
+  set.seed(seed)
   
-  dR_drift <- eta * I_wn[k - 1] -
-    mu * R_wn[k - 1]
-  
-  
-  dW1 <- dW_matrix[k - 1, 1]
-  dW2 <- dW_matrix[k - 1, 2]
-  dW3 <- dW_matrix[k - 1, 3]
-  
-  S_wn[k] <- S_wn[k - 1] +
-    dS_drift * dt +
-    S_wn[k - 1] * dW1
-  
-  I_wn[k] <- I_wn[k - 1] +
-    dI_drift * dt +
-    I_wn[k - 1] * dW2
-  
-  R_wn[k] <- R_wn[k - 1] +
-    dR_drift * dt +
-    R_wn[k - 1] * dW3
-}
-
-## ====== 3. White noise + jump solution ======
-
-S_wnj <- numeric(steps)
-I_wnj <- numeric(steps)
-R_wnj <- numeric(steps)
-
-S_wnj[1] <- S0
-I_wnj[1] <- I0
-R_wnj[1] <- R0
-
-for (k in 2:steps) {
-  
-  # Drift terms
-  
-  dS_drift <- Lambda -
-    (mu - gamma_1) * S_wnj[k - 1] -
-    beta * S_wnj[k - 1] * I_wnj[k - 1]
-  
-  dI_drift <- beta * S_wnj[k - 1] * I_wnj[k - 1] -
-    (mu + epsilon + eta - gamma_2) *
-    I_wnj[k - 1]
-  
-  dR_drift <- eta * I_wnj[k - 1] -
-    (mu - gamma_3) * R_wnj[k - 1]
-  
-  # Use the same Brownian motion increments as in the white-noise model
-  
-  dW1 <- dW_matrix[k - 1, 1]
-  dW2 <- dW_matrix[k - 1, 2]
-  dW3 <- dW_matrix[k - 1, 3]
-  
-  # Obtain jump terms
-  
-  jump_S <- jump_vector[1, k - 1] *
-    S_wnj[k - 1]
-  
-  jump_I <- jump_vector[2, k - 1] *
-    I_wnj[k - 1]
-  
-  jump_R <- jump_vector[3, k - 1] *
-    R_wnj[k - 1]
-  
-  # Euler-Maruyama update with white noise and jumps
-  
-  S_wnj[k] <- S_wnj[k - 1] +
-    dS_drift * dt +
-    S_wnj[k - 1] * dW1 +
-    jump_S
-  
-  I_wnj[k] <- I_wnj[k - 1] +
-    dI_drift * dt +
-    I_wnj[k - 1] * dW2 +
-    jump_I
-  
-  R_wnj[k] <- R_wnj[k - 1] +
-    dR_drift * dt +
-    R_wnj[k - 1] * dW3 +
-    jump_R
-}
-
-## ====== Create data frame ======
-
-out_df1 <- data.frame(
-  time = time,
-  S_det = S_det,
-  I_det = I_det,
-  R_det = R_det,
-  S_wn = S_wn,
-  I_wn = I_wn,
-  R_wn = R_wn,
-  S_wnj = S_wnj,
-  I_wnj = I_wnj,
-  R_wnj = R_wnj
-)
-
-par(mfrow = c(1, 1),
-    mar = c(4, 4, 2, 1),
-    oma = c(0, 0, 2, 0))
-
-# Comparison of S(t)
-
-plot(out_df1$time, out_df1$S_det,
-     type = "l", col = "black", lwd = 2,
-     xlab = "Time ",
-     ylab = "S(t)",
-     ylim = range(c(0,
-                    out_df1$S_det,
-                    out_df1$S_wn,
-                    out_df1$S_wnj)))
-
-lines(out_df1$time, out_df1$S_wn,
-      col = "blue", lwd = 1.5)
-
-lines(out_df1$time, out_df1$S_wnj,
-      col = "red", lwd = 1.5)
-
-legend("topright",
-       legend = c("Deterministic",
-                  "White noise",
-                  "White noise + \nTempered stable"),
-       col = c("black", "blue", "red"),
-       lwd = c(2, 1.5, 1.5),
-       bty = "n",
-       cex = 0.8)
-
-# Comparison of I(t)
-
-plot(out_df1$time, out_df1$I_det,
-     type = "l", col = "black", lwd = 2,
-     xlab = "Time ",
-     ylab = " I(t)",
-     ylim = range(c(out_df1$I_det,
-                    out_df1$I_wn,
-                    out_df1$I_wnj)))
-
-lines(out_df1$time, out_df1$I_wn,
-      col = "blue", lwd = 1.5)
-
-lines(out_df1$time, out_df1$I_wnj,
-      col = "red", lwd = 1.5)
-
-legend("topright",
-       legend = c("Deterministic",
-                  "White noise",
-                  "White noise + \nTempered stable"),
-       col = c("black", "blue", "red"),
-       lwd = c(2, 1.5, 1.5),
-       bty = "n",
-       cex = 0.8)
-
-# Comparison of R(t)
-
-plot(out_df1$time, out_df1$R_det,
-     type = "l", col = "black", lwd = 2,
-     xlab = "Time",
-     ylab = "R(t)",
-     ylim = range(c(out_df1$R_det,
-                    out_df1$R_wn,
-                    out_df1$R_wnj)))
-
-lines(out_df1$time, out_df1$R_wn,
-      col = "blue", lwd = 1.5)
-
-lines(out_df1$time, out_df1$R_wnj,
-      col = "red", lwd = 1.5)
-
-legend("topright",
-       legend = c("Deterministic",
-                  "White noise",
-                  "White noise + \nTempered stable"),
-       col = c("black", "blue", "red"),
-       lwd = c(2, 1.5, 1.5),
-       bty = "n",
-       cex = 0.8)
-
-
-
-## ====== Time averages ======
-
-avg_S_wnj <- numeric(steps)
-avg_I_wnj <- numeric(steps)
-avg_R_wnj <- numeric(steps)
-
-avg_S_wnj[1] <- NA
-avg_I_wnj[1] <- NA
-avg_R_wnj[1] <- NA
-
-for (k in 2:steps) {
-  
-  current_time <- time[k]
-  
-  integral_S_wnj <- sum(
-    (S_wnj[1:(k - 1)] + S_wnj[2:k]) * dt / 2
+  n_step <- as.integer(
+    round(T_end / dt)
   )
   
-  integral_I_wnj <- sum(
-    (I_wnj[1:(k - 1)] + I_wnj[2:k]) * dt / 2
+  rec_every <- as.integer(
+    round(rec_dt / dt)
   )
   
-  integral_R_wnj <- sum(
-    (R_wnj[1:(k - 1)] + R_wnj[2:k]) * dt / 2
+  n_rec <- n_step %/% rec_every
+  
+  # Cholesky factor of Phi
+  chol_phi <- chol(Phi)
+  
+  # Log-coordinate state:
+  # Y = (log(S), log(I), log(R))
+  Y <- matrix(
+    rep(log(x0), each = n_path),
+    nrow = n_path,
+    ncol = 3
   )
   
-  avg_S_wnj[k] <- integral_S_wnj / current_time
-  avg_I_wnj[k] <- integral_I_wnj / current_time
-  avg_R_wnj[k] <- integral_R_wnj / current_time
+  rec_t <- numeric(n_rec + 1L)
+  
+  rec <- array(
+    NA_real_,
+    dim = c(n_rec + 1L, n_path, 3L),
+    dimnames = list(
+      NULL,
+      NULL,
+      c("S", "I", "R")
+    )
+  )
+  
+  rec[1, , ] <- exp(Y)
+  rec_t[1] <- 0
+  
+  ir <- 1L
+  
+  for (k in seq_len(n_step)) {
+    
+    # Correlated Brownian increment
+    Z <- matrix(
+      rnorm(n_path * 3L),
+      nrow = n_path,
+      ncol = 3L
+    )
+    
+    dW <- sqrt(dt) * (Z %*% chol_phi)
+    
+    # Brownian-only or Brownian+TS
+    if (driver == "Brownian+TS") {
+      
+      dJ <- ts_log_increment(
+        dt = dt,
+        n = n_path
+      )
+      
+    } else {
+      
+      dJ <- matrix(
+        0,
+        nrow = n_path,
+        ncol = 3L
+      )
+    }
+    
+    X <- exp(Y)
+    
+    S <- X[, 1]
+    I <- X[, 2]
+    R <- X[, 3]
+    
+    # Log-coordinate drift
+    drift <- cbind(
+      Lam / S -
+        mu_drift[1] -
+        beta * I -
+        Phi[1, 1] / 2,
+      
+      beta * S -
+        mu_drift[2] -
+        Phi[2, 2] / 2,
+      
+      I / R -
+        mu_drift[3] -
+        Phi[3, 3] / 2
+    )
+    
+    # Euler step
+    Y <- Y +
+      drift * dt +
+      dW +
+      dJ
+    
+    # Save the current state
+    if (k %% rec_every == 0L) {
+      
+      ir <- ir + 1L
+      
+      rec_t[ir] <- k * dt
+      
+      rec[ir, , ] <- exp(Y)
+    }
+  }
+  
+  list(
+    time = rec_t,
+    values = rec,
+    beta = beta,
+    driver = driver,
+    seed = seed,
+    dt = dt,
+    n_path = n_path
+  )
 }
 
-## ====== Create data frame ======
+# ----------------------------- summaries -------------------------------
 
-out_df2 <- data.frame(
-  time = time,
-  S_wnj = S_wnj,
-  I_wnj = I_wnj,
-  R_wnj = R_wnj,
-  avg_S_wnj = avg_S_wnj,
-  avg_I_wnj = avg_I_wnj,
-  avg_R_wnj = avg_R_wnj
+summarise_run <- function(sim) {
+  
+  vals <- sim$values
+  
+  out <- vector(
+    "list",
+    length(sim$time) * 3L
+  )
+  
+  z <- 1L
+  
+  for (j in seq_len(3L)) {
+    
+    for (i in seq_along(sim$time)) {
+      
+      q <- quantile(
+        vals[i, , j],
+        probs = c(
+          0.05,
+          0.25,
+          0.50,
+          0.75,
+          0.95
+        ),
+        names = FALSE,
+        type = 7
+      )
+      
+      out[[z]] <- data.frame(
+        time = sim$time[i],
+        variable = c("S", "I", "R")[j],
+        q05 = q[1],
+        q25 = q[2],
+        median = q[3],
+        q75 = q[4],
+        q95 = q[5],
+        beta = sim$beta,
+        driver = sim$driver
+      )
+      
+      z <- z + 1L
+    }
+  }
+  
+  do.call(
+    rbind,
+    out
+  )
+}
+
+# ------------------------------ simulation -----------------------------
+
+all_runs <- list()
+all_summary <- list()
+
+counter <- 0L
+
+for (b0 in betas) {
+  
+  for (drv in c("Brownian", "Brownian+TS")) {
+    
+    counter <- counter + 1L
+    
+    sim <- simulate_sir(
+      beta = b0,
+      driver = drv,
+      T_end = T_end,
+      dt = dt,
+      rec_dt = rec_dt,
+      n_path = n_path,
+      x0 = x0,
+      seed = 7000L + counter
+    )
+    
+    all_runs[[counter]] <- sim
+    
+    all_summary[[counter]] <- summarise_run(sim)
+    
+    message(
+      sprintf(
+        "finished %s, beta = %.3f",
+        drv,
+        b0
+      )
+    )
+  }
+}
+
+summary_df <- do.call(
+  rbind,
+  all_summary
 )
 
-par(
-  mfrow = c(3, 1),
-  mar = c(2, 4, 1, 1),
-  oma = c(4, 5, 1, 1)
+# ------------------------------- plotting -------------------------------
+
+cols <- c(
+  "Brownian" = "#0072B2",
+  "Brownian+TS" = "#D55E00"
 )
 
-## ---------- 1) S(t) ----------
+# Format logarithmic ticks as 10^k
+pow10_labels <- function(x) {
+  parse(
+    text = paste0(
+      "10^",
+      round(log10(x))
+    )
+  )
+}
 
-yS_lim <- range(
-  out_df2$avg_S_wnj,
-  na.rm = TRUE
+make_panel <- function(
+    b0,
+    variable,
+    show_x = FALSE
+) {
+  
+  d <- summary_df[
+    summary_df$beta == b0 &
+      summary_df$variable == variable,
+  ]
+  
+  p <- ggplot(
+    d,
+    aes(
+      x = time,
+      colour = driver,
+      fill = driver
+    )
+  ) +
+    geom_ribbon(
+      aes(
+        ymin = q05,
+        ymax = q95
+      ),
+      alpha = 0.16,
+      colour = NA
+    ) +
+    geom_ribbon(
+      aes(
+        ymin = q25,
+        ymax = q75
+      ),
+      alpha = 0.34,
+      colour = NA
+    ) +
+    geom_line(
+      aes(y = median),
+      size = 0.65
+    ) +
+    scale_colour_manual(
+      values = cols
+    ) +
+    scale_fill_manual(
+      values = cols
+    ) +
+    labs(
+      x = NULL,
+      y = if (b0 == betas[1]) variable else NULL
+    ) +
+    theme_bw(
+      base_size = 9
+    ) +
+    theme(
+      legend.position = "none",
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(
+        colour = "grey88",
+        size = 0.25
+      ),
+      plot.margin = margin(
+        3,
+        4,
+        2,
+        3
+      ),
+      plot.title = element_text(
+        hjust = 0.5,
+        size = 10
+      ),
+      axis.title = element_text(
+        size = 9
+      ),
+      axis.text = element_text(
+        size = 8
+      ),
+      axis.text.x = if (show_x) {
+        element_text(size = 8)
+      } else {
+        element_blank()
+      },
+      axis.ticks.x = if (show_x) {
+        element_line()
+      } else {
+        element_blank()
+      }
+    )
+  
+  if (variable == "S") {
+    
+    p <- p +
+      scale_y_continuous(
+        expand = expansion(
+          mult = c(
+            0.03,
+            0.05
+          )
+        )
+      )
+    
+  } else {
+    
+    if (variable == "I") {
+      ybreaks <- 10^c(
+        -9,
+        -6,
+        -3,
+        0,
+        1
+      )
+    } else {
+      ybreaks <- 10^c(
+        -6,
+        -3,
+        0,
+        1
+      )
+    }
+    
+    p <- p +
+      scale_y_log10(
+        breaks = ybreaks,
+        labels = pow10_labels
+      )
+    
+    if (b0 == 0.232) {
+      
+      p <- p +
+        geom_hline(
+          yintercept = 1e-3,
+          linetype = "dashed",
+          size = 0.45,
+          colour = "grey25"
+        )
+    }
+  }
+  
+  if (variable == "S") {
+    
+    p <- p +
+      ggtitle(
+        bquote(
+          beta == .(b0)
+        )
+      )
+  }
+  
+  p +
+    coord_cartesian(
+      xlim = c(
+        0,
+        T_end
+      )
+    )
+}
+
+# First row
+p11 <- make_panel(
+  0.232,
+  "S",
+  show_x = FALSE
 )
 
-plot(
-  out_df2$time,
-  out_df2$avg_S_wnj,
-  type = "l",
-  lwd = 2,
-  col = "blue",
-  xlab = "",
-  ylab = "",
-  ylim = yS_lim,
-  yaxt = "n"
+p12 <- make_panel(
+  0.316,
+  "S",
+  show_x = FALSE
 )
 
-axis(2, at = pretty(yS_lim))
-
-legend(
-  "bottomright",
-  inset = c(0.01, 0.15),
-  bty = "n",
-  lwd = 2,
-  legend = expression(
-    paste(frac(1, t) * integral(S(r) * dr, 0, t))
-  ),
-  col = "blue"
+# Second row
+p21 <- make_panel(
+  0.232,
+  "I",
+  show_x = FALSE
 )
 
-## ---------- 2) I(t) ----------
-
-yI_lim <- range(
-  out_df2$avg_I_wnj,
-  na.rm = TRUE
+p22 <- make_panel(
+  0.316,
+  "I",
+  show_x = FALSE
 )
 
-plot(
-  out_df2$time,
-  out_df2$avg_I_wnj,
-  type = "l",
-  lwd = 2,
-  col = "blue",
-  xlab = "",
-  ylab = "",
-  ylim = yI_lim,
-  yaxt = "n"
+# Third row
+p31 <- make_panel(
+  0.232,
+  "R",
+  show_x = TRUE
 )
 
-axis(2, at = pretty(yI_lim))
-
-legend(
-  "topright",
-  bty = "n",
-  lwd = 2,
-  legend = expression(
-    paste(frac(1, t) * integral(I(r) * dr, 0, t))
-  ),
-  col = "blue"
+p32 <- make_panel(
+  0.316,
+  "R",
+  show_x = TRUE
 )
 
-## ---------- 3) R(t) ----------
+# -------------------------- arrange six panels --------------------------
 
-yR_lim <- range(
-  out_df2$avg_R_wnj,
-  na.rm = TRUE
+draw_figure <- function(
+    file = NULL,
+    device = c("png", "pdf")
+) {
+  
+  device <- match.arg(device)
+  
+  if (!is.null(file)) {
+    
+    if (device == "png") {
+      
+      png(
+        file,
+        width = 2160,
+        height = 2040,
+        res = 300,
+        bg = "white"
+      )
+    }
+    
+    if (device == "pdf") {
+      
+      pdf(
+        file,
+        width = 7.2,
+        height = 6.8,
+        useDingbats = FALSE,
+        paper = "special"
+      )
+    }
+    
+    on.exit(
+      dev.off(),
+      add = TRUE
+    )
+  }
+  
+  grid.newpage()
+  
+  pushViewport(
+    viewport(
+      layout = grid.layout(
+        nrow = 5,
+        ncol = 2,
+        heights = unit(
+          c(
+            1,
+            1,
+            1,
+            0.12,
+            0.16
+          ),
+          c(
+            "null",
+            "null",
+            "null",
+            "null",
+            "null"
+          )
+        )
+      )
+    )
+  )
+  
+  panel_list <- list(
+    p11,
+    p12,
+    p21,
+    p22,
+    p31,
+    p32
+  )
+  
+  positions <- list(
+    c(1, 1),
+    c(1, 2),
+    c(2, 1),
+    c(2, 2),
+    c(3, 1),
+    c(3, 2)
+  )
+  
+  for (i in seq_along(panel_list)) {
+    
+    print(
+      panel_list[[i]],
+      vp = viewport(
+        layout.pos.row = positions[[i]][1],
+        layout.pos.col = positions[[i]][2]
+      )
+    )
+  }
+  
+  # t below the left and right bottom panels
+  pushViewport(
+    viewport(
+      layout.pos.row = 4,
+      layout.pos.col = 1:2
+    )
+  )
+  
+  grid.text(
+    expression(t),
+    x = unit(0.25, "npc"),
+    y = unit(0.55, "npc"),
+    gp = gpar(fontsize = 10)
+  )
+  
+  grid.text(
+    expression(t),
+    x = unit(0.75, "npc"),
+    y = unit(0.55, "npc"),
+    gp = gpar(fontsize = 10)
+  )
+  
+  popViewport()
+  
+  # Legend
+  pushViewport(
+    viewport(
+      layout.pos.row = 5,
+      layout.pos.col = 1:2
+    )
+  )
+  
+  grid.lines(
+    x = unit(
+      c(
+        0.34,
+        0.38
+      ),
+      "npc"
+    ),
+    y = unit(
+      0.25,
+      "npc"
+    ),
+    gp = gpar(
+      col = cols["Brownian"],
+      lwd = 2.2
+    )
+  )
+  
+  grid.text(
+    "Brownian",
+    x = unit(
+      0.39,
+      "npc"
+    ),
+    y = unit(
+      0.25,
+      "npc"
+    ),
+    just = "left",
+    gp = gpar(
+      fontsize = 9
+    )
+  )
+  
+  grid.lines(
+    x = unit(
+      c(
+        0.58,
+        0.62
+      ),
+      "npc"
+    ),
+    y = unit(
+      0.25,
+      "npc"
+    ),
+    gp = gpar(
+      col = cols["Brownian+TS"],
+      lwd = 2.2
+    )
+  )
+  
+  grid.text(
+    "Brownian+Tempered stable",
+    x = unit(
+      0.63,
+      "npc"
+    ),
+    y = unit(
+      0.25,
+      "npc"
+    ),
+    just = "left",
+    gp = gpar(
+      fontsize = 9
+    )
+  )
+  
+  popViewport()
+  popViewport()
+}
+
+draw_figure(
+  "brownian_vs_brownian_ts_SIR.png",
+  "png"
 )
 
-plot(
-  out_df2$time,
-  out_df2$avg_R_wnj,
-  type = "l",
-  lwd = 2,
-  col = "blue",
-  xlab = "",
-  ylab = "",
-  ylim = yR_lim,
-  yaxt = "n"
-)
-
-axis(2, at = pretty(yR_lim))
-
-legend(
-  "bottomright",
-  inset = c(0.01, 0.15),
-  bty = "n",
-  lwd = 2,
-  legend = expression(
-    paste(frac(1, t) * integral(R(r) * dr, 0, t))
-  ),
-  col = "blue"
-)
-
-mtext(
-  "Time",
-  side = 1,
-  outer = TRUE,
-  line = 1.5
-)
-
-mtext(
-  "Time average of population",
-  side = 2,
-  outer = TRUE,
-  line = 2.5
+draw_figure(
+  "brownian_vs_brownian_ts_SIR.pdf",
+  "pdf"
 )
