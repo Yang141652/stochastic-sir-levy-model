@@ -17,7 +17,6 @@ os.makedirs(OUT, exist_ok=True)
 
 
 # ============================================================
-# 参数
 # ============================================================
 LAM, MU, EPS = 8.0, 0.75, 0.5
 G1 = (-0.3, 0.5, 0.2)
@@ -39,15 +38,12 @@ LAW = dict(
 
 P = T.setup(**LAW)
 
-# 只使用 Brownian + 六方向 TS
-# 在 simulate_paths() 中，最终更新为 dE + dJ
 DRIVERS = ("TS6",)
 
 NAMES = {
     "TS6": "Brownian + Tempered stable"
 }
 
-# TS1 的方向参数虽然不会被使用，但 build 函数需要传入
 B = D.build(
     LAM,
     MU,
@@ -60,19 +56,18 @@ B = D.build(
 
 
 # ============================================================
-# 两个 beta 情形
 # ============================================================
 X0 = (5.551, 0.5, 0.1)
 
 REGIMES = {
-    # 疾病灭绝情形
+
     "band": {
         "beta": 0.232,
         "x0": X0,
         "T": 600.0
     },
 
-    # 疾病持续情形
+
     "per": {
         "beta": 0.316,
         "x0": X0,
@@ -80,8 +75,8 @@ REGIMES = {
     }
 }
 
+
 # ============================================================
-# 模拟 Brownian + TS6 路径
 # ============================================================
 def simulate_paths(
     beta,
@@ -94,21 +89,21 @@ def simulate_paths(
     rec_dt=0.25
 ):
     """
-    模拟包含 Brownian 噪声和六方向 TS 噪声的 SIR 系统。
+    Simulate SIR paths driven by Brownian noise and six-direction TS noise.
     """
 
     D.SIM.rng = np.random.default_rng(seed)
 
     Gm = np.linalg.cholesky(PHI)
 
-    # driver 为 TS6
+    # The driver is TS6
     m1, m2, m3 = B["mu_x"][driver]
 
     nstep = int(round(T_end / dt))
     rec_every = int(round(rec_dt / dt))
     nrec = nstep // rec_every + 1
 
-    # 对数坐标
+    # Logarithmic coordinates
     Y = np.tile(np.log(x0), (npath, 1))
 
     rec_t = np.zeros(nrec)
@@ -119,7 +114,7 @@ def simulate_paths(
         "R": np.empty((nrec, npath))
     }
 
-    # 初值
+    # Initial conditions
     rec["S"][0] = np.exp(Y[:, 0])
     rec["I"][0] = np.exp(Y[:, 1])
     rec["R"][0] = np.exp(Y[:, 2])
@@ -128,14 +123,14 @@ def simulate_paths(
 
     for k in range(nstep):
 
-        # Brownian 增量
+        # Brownian increments
         dE = (
             np.sqrt(dt)
             * D.SIM.rng.standard_normal((npath, 3))
             @ Gm.T
         )
 
-        # 六方向 TS 增量
+        # Six-direction TS increments
         dJ = B["jumps"][driver](dt, npath)
 
         S = np.exp(Y[:, 0])
@@ -148,10 +143,10 @@ def simulate_paths(
             I / R - m3 - PHI[2, 2] / 2
         ], axis=1)
 
-        # Brownian + TS 同时作用
+        # Brownian and TS noise act simultaneously
         Y = Y + drift * dt + dE + dJ
 
-        # 保存路径
+        # Save paths
         if (k + 1) % rec_every == 0:
 
             t = (k + 1) * dt
@@ -171,19 +166,19 @@ def simulate_paths(
 
 
 # ============================================================
-# 累计长时间平均
+# Cumulative long-time averages
 # ============================================================
 def running_average(X, t):
     """
     X.shape = (n_time, n_path)
 
-    返回每条路径的累计时间平均：
+    Return the cumulative time average for each path:
         1/t * integral_0^t X(s) ds
     """
 
     avg = np.empty_like(X, dtype=float)
 
-    # t=0 时使用初始值
+    # Use the initial value at t = 0
     avg[0] = X[0]
 
     dt = np.diff(t)
@@ -202,7 +197,7 @@ def running_average(X, t):
 
 def quantiles(X):
     """
-    返回 5%、25%、50%、75%、95% 分位数。
+    Return the 5th, 25th, 50th, 75th, and 95th percentiles.
     """
     return np.percentile(
         X,
@@ -212,7 +207,7 @@ def quantiles(X):
 
 
 # ============================================================
-# 模拟并计算长时间平均
+# Simulations and computation of long-time averages
 # ============================================================
 DATA_AVG = {}
 
@@ -222,7 +217,7 @@ for reg, cfg in REGIMES.items():
 
     for j, driver in enumerate(DRIVERS):
 
-        # 两个 beta 情形使用不同随机种子
+        # Use different random seeds for the two beta cases
         seed = 35100 + 100 * j + (
             0 if reg == "band" else 10
         )
@@ -238,7 +233,7 @@ for reg, cfg in REGIMES.items():
             rec_dt=0.25
         )
 
-        # 计算 S、I、R 的累计时间平均
+        # Compute cumulative time averages of S, I, and R
         S_avg = running_average(rec["S"], t)
         I_avg = running_average(rec["I"], t)
         R_avg = running_average(rec["R"], t)
@@ -252,7 +247,7 @@ for reg, cfg in REGIMES.items():
 
 
 # ============================================================
-# 理论长期平均值
+# Theoretical long-time averages
 # ============================================================
 THEORY = {}
 
@@ -263,13 +258,13 @@ for reg, cfg in REGIMES.items():
     for driver in DRIVERS:
 
         if reg == "band":
-            # 疾病灭绝态
+            # Disease extinction regime
             S_theory = LAM / B["a"][0]
             I_theory = 0.0
             R_theory = 0.0
 
         else:
-            # 疾病持续态
+            # Disease persistence regime
             sm = D.summary(
                 B["laws"][driver],
                 cfg["beta"],
@@ -290,7 +285,7 @@ for reg, cfg in REGIMES.items():
 
 
 # ============================================================
-# 绘图
+# Plotting
 # ============================================================
 fig, ax = plt.subplots(
     3,
@@ -300,14 +295,14 @@ fig, ax = plt.subplots(
 )
 
 variables = [
-    ("S", r"$\frac{1}{t}\int_0^t S(s)\,ds$"),
-    ("I", r"$\frac{1}{t}\int_0^t I(s)\,ds$"),
-    ("R", r"$\frac{1}{t}\int_0^t R(s)\,ds$")
+    ("S", r"$\frac{1}{t}\int_0^t S(s)\\,ds$"),
+    ("I", r"$\frac{1}{t}\int_0^t I(s)\\,ds$"),
+    ("R", r"$\frac{1}{t}\int_0^t R(s)\\,ds$")
 ]
 
 reg_order = ["band", "per"]
 
-# 只保留一条 Brownian + TS 曲线
+# Keep only one Brownian + TS curve
 color = "#0072B2"
 
 for col, reg in enumerate(reg_order):
@@ -322,7 +317,7 @@ for col, reg in enumerate(reg_order):
         t = DATA_AVG[reg][driver]["t"]
         q = DATA_AVG[reg][driver][var]
 
-        # 90% 区间
+        # 90% interval
         A.fill_between(
             t,
             q[0],
@@ -332,7 +327,7 @@ for col, reg in enumerate(reg_order):
             linewidth=0
         )
 
-        # 50% 区间
+        # 50% interval
         A.fill_between(
             t,
             q[1],
@@ -342,7 +337,7 @@ for col, reg in enumerate(reg_order):
             linewidth=0
         )
 
-        # 中位数
+        # Median
         A.plot(
             t,
             q[2],
@@ -351,7 +346,7 @@ for col, reg in enumerate(reg_order):
             label=NAMES[driver]
         )
 
-        # 理论地方病平均值
+        # Theoretical endemic average
         theory = THEORY[reg][driver][var]
 
         if theory > 0:
@@ -363,16 +358,16 @@ for col, reg in enumerate(reg_order):
                 alpha=0.9
             )
 
-        # 左侧 I、R 图添加准灭绝水平线
+        # Add a quasi-extinction reference line to the left I and R panels
 
-        # 左列 t=0--600，右列 t=0--100
+        # The left column covers t = 0--600, and the right column covers t = 0--80
         if col == 0:
             A.set_xlim(0.0, 600.0)
         else:
             A.set_xlim(0.0, 80.0)
 
-        # 纵坐标设置
-        # 左侧 I、R 使用压缩后的对数坐标
+        # Y-axis settings
+        # Use a compressed logarithmic scale for I and R in the left column
         if col == 0 and var in ("I", "R"):
 
             A.set_yscale(
@@ -382,7 +377,7 @@ for col, reg in enumerate(reg_order):
                 base=10
             )
 
-            # 只保留少量刻度
+            # Keep only a few tick marks
             A.set_yticks([
                 0.0,
                 1e-1,
@@ -423,7 +418,7 @@ for col, reg in enumerate(reg_order):
                 A.set_xticks([0, 20, 40, 60, 80])
 
 
-# 只显示一个图例：Brownian + TS
+# Show only one legend: Brownian + TS
 handles, labels = ax[0, 0].get_legend_handles_labels()
 
 fig.legend(
